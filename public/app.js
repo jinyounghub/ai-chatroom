@@ -22,13 +22,6 @@ const ICON = {
 const QUICK_EMOJI = ['👍', '😂', '❤️', '😮', '🤔', '🔥', '👀', '🙏'];
 const IMG_EXT = ['png', 'jpg', 'jpeg', 'webp', 'gif', 'svg'];
 const AI_IDS = ['claude', 'gpt', 'grok', 'gemini'];
-// Every spelling that calls a member, in any room language (same lists as lib/members.mjs).
-const ALIASES = {
-  claude: ['claude', '클로드', 'クロード'],
-  gpt: ['chatgpt', 'gpt', '지피티', '챗지피티', '쳇지피티', 'チャットgpt', 'チャッピー', 'ジーピーティー'],
-  grok: ['grok', '그록', 'グロック', 'グロク'],
-  gemini: ['gemini', '제미나이', '제미니', 'ジェミニ', 'ジェミナイ'],
-};
 const STATUSES = ['idle', 'reading', 'typing', 'away', 'sleeping', 'off', 'missing', 'error'];
 const statusText = (st) => (STATUSES.includes(st) ? t(`status.${st}`) : st);
 
@@ -48,7 +41,7 @@ const input = $('#input');
 
 const extOf = (p) => (String(p).split('.').pop() || '').toLowerCase();
 const wsUrl = (p, bust) => '/ws/' + String(p).split('/').map(encodeURIComponent).join('/') + (bust ? `?t=${bust}` : '');
-// The dev session (Claude Code, joined through the dev bridge) is a participant but not a scheduled AI.
+// The dev session (joined through the dev bridge) is a participant but not a scheduled AI.
 const DEV = {
   id: 'dev', name: t('dev.name'), color: '#0f766e',
   aliases: ['개발자', '개발 세션', '개발세션', '빌더', 'dev', 'developer', '開発者', 'デベロッパー'],
@@ -116,13 +109,13 @@ const norm = (x) => String(x).toLowerCase()
 // name must not run on into more Latin letters ("@device" is not "@dev").
 function mentionHit(word) {
   const cands = [];
-  for (const id of AI_IDS) for (const a of [...ALIASES[id], nameOf(id)]) cands.push([norm(a), colorOf(id)]);
+  for (const id of AI_IDS) for (const a of [...(S.members[id]?.aliases || []), nameOf(id)]) cands.push([norm(a), colorOf(id)]);
   cands.push([norm(nameOf('user')), 'var(--mine)']);
   for (const a of [...DEV.aliases, DEV.name]) cands.push([norm(a), DEV.color]);
   let best = null;
   for (const [a, color] of cands) {
     if (!a || (best && a.length <= best.len) || norm(word.slice(0, a.length)) !== a) continue;
-    if (/[a-z0-9_]$/.test(a) && /^[A-Za-z0-9_]/.test(word.slice(a.length))) continue;
+    if (/^[A-Za-z0-9_-]/.test(word.slice(a.length))) continue;
     best = { len: a.length, color };
   }
   return best;
@@ -137,7 +130,7 @@ function inline(s) {
   h = h.replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>');
   h = h.replace(/(https?:\/\/[^\s<]+[^\s<.,)\]'"])/g, '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>');
   // Any script: Latin, Hangul, kana, kanji.
-  h = h.replace(/@([\p{L}\p{N}_]+)/gu, (m, word) => {
+  h = h.replace(/@([\p{L}\p{N}_-]+)/gu, (m, word) => {
     const hit = mentionHit(word);
     if (!hit) return m;
     return `<span class="mention" style="--c:${hit.color}">@${word.slice(0, hit.len)}</span>${word.slice(hit.len)}`;
@@ -879,10 +872,10 @@ input.addEventListener('keydown', (e) => {
 
 function updateMention() {
   const upto = input.value.slice(0, input.selectionStart);
-  const m = upto.match(/@([\p{L}\p{N}_]*)$/u);
+  const m = upto.match(/@([\p{L}\p{N}_-]*)$/u);
   if (!m) { closeMention(); return; }
   const q = norm(m[1]);
-  const ids = AI_IDS.filter((id) => S.members[id] && (!q || [nameOf(id), ...ALIASES[id]].some((a) => norm(a).startsWith(q))));
+  const ids = AI_IDS.filter((id) => S.members[id] && (!q || [nameOf(id), ...(S.members[id]?.aliases || [])].some((a) => norm(a).startsWith(q))));
   if (!q || [DEV.name, ...DEV.aliases].some((a) => norm(a).startsWith(q))) ids.push(DEV.id);
   if (!ids.length) { closeMention(); return; }
   S.mention = { start: upto.length - m[0].length, index: 0 };
@@ -1166,7 +1159,7 @@ function renderUsage() {
   };
   head.append(intro, btn);
   const list = el('div', 'usage-list');
-  for (const id of AI_IDS) list.append(usageCard(id));
+  list.append(usageCard('gpt')); // One account, not four independent quota pools.
   box.append(head, list);
 }
 
@@ -1176,7 +1169,7 @@ function usageCard(id) {
   const card = el('section', 'u-card');
   card.setAttribute('aria-label', t('usage.cardAria', { name: nameOf(id) }));
   const h = el('div', 'u-head', `<img src="${avatar(id)}" alt=""><div class="u-title"><div class="n"></div><div class="s"></div></div>`);
-  h.querySelector('.n').textContent = nameOf(id);
+  h.querySelector('.n').textContent = t('usage.shared');
   h.querySelector('.s').textContent = [u.plan, u.at ? t('usage.checkedAgo', { ago: ago(u.at) }) : null].filter(Boolean).join(' · ') || t('usage.notChecked');
   card.append(h);
   if (u.ok === false) {
@@ -1188,7 +1181,7 @@ function usageCard(id) {
   if (!ws.length && u.ok !== false) card.append(el('div', 'u-empty', esc(t('usage.loading'))));
   for (const w of ws) card.append(windowBlock(w));
   const foot = el('div', 'u-foot');
-  foot.textContent = t('usage.calls30', { n: u.calls30 ?? 0 }) + (m?.boostModel ? ` · ${t('usage.boostModel', { model: m.boostModel })}` : '');
+  foot.textContent = t('usage.calls30', { n: AI_IDS.reduce((sum, key) => sum + (S.usage[key]?.calls30 || 0), 0) });
   card.append(foot);
   return card;
 }

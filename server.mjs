@@ -1,4 +1,4 @@
-// AI 단톡방 — Claude, ChatGPT, Grok and Gemini chatting in one web room.
+// AI 단톡방 — four independent ChatGPT members, one logged-in Codex CLI.
 // Zero-dependency Node server: static UI + SSE + one independent loop per AI.
 
 import http from 'node:http';
@@ -10,6 +10,7 @@ import { spawn } from 'node:child_process';
 import { setLang, getLang, pick, LANG_DEFAULTS } from './lib/i18n.mjs';
 import { Store } from './lib/store.mjs';
 import { Adapters, killAll } from './lib/agents.mjs';
+import { normalizeAgents } from './lib/chatgpt-config.mjs';
 import { UsageMonitor } from './lib/usage.mjs';
 import { buildBrief, buildTurn, parseAction, modelLabel } from './lib/prompt.mjs';
 import { Router } from './lib/router.mjs';
@@ -28,7 +29,7 @@ const DEFAULT_CFG = {
   language: 'auto',
   roomName: '',
   userName: '',
-  maxInFlight: 3,
+  maxInFlight: 1,
   historyForPrompt: 40,
   autoSleepMinutes: 30,
   speed: 'normal',
@@ -41,7 +42,7 @@ const DEFAULT_CFG = {
   usagePollSec: 120,
   usagePollIdleSec: 600,
   // 진심모드 (per-turn model routing, see lib/router.mjs)
-  boost: { mode: 'auto', timeoutSec: 360, selfCooldownSec: 180, aiRequestCooldownSec: 180 },
+  boost: { mode: 'manual', timeoutSec: 360, selfCooldownSec: 180, aiRequestCooldownSec: 180 },
   // dev bridge (lib/dev.mjs): AI bubbles allowed after a dev message, and dev messages
   // allowed without the user, before the AIs pause until the user speaks
   dev: { enabled: true, replyCap: 6, roundsWithoutUser: 8 },
@@ -52,18 +53,16 @@ const DEFAULT_CFG = {
   // no dev bridge API. Off unless config.json turns it on.
   external: { enabled: false, port: 18321, host: '0.0.0.0', https: true },
   // model/effort = default; boost = what a 진심모드 turn overrides (null disables it)
-  agents: {
-    claude: { model: 'sonnet', boost: { model: 'opus' } },
-    gpt: { model: 'gpt-6-sol', effort: 'low', boost: { model: 'gpt-6-astra', effort: 'medium' }, imageModel: 'gpt-6-luna' },
-    grok: { model: 'grok-4.7', effort: 'low', boost: { effort: 'high' } },
-    gemini: { model: 'gemini-3.8-flash-medium', rotate: 4, boost: { model: 'gemini-3.8-flash-high' } },
-  },
+  agents: normalizeAgents(),
 };
 
 function loadConfig() {
   let user = {};
   const file = process.env.CHATROOM_CONFIG ? path.resolve(process.env.CHATROOM_CONFIG) : path.join(ROOT, 'config.json');
-  try { user = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { /* defaults */ }
+  try { user = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) {
+    if (e.code !== 'ENOENT') throw new Error(`Cannot read config ${file}: ${e.message}`);
+  }
+  if (!user || typeof user !== 'object' || Array.isArray(user)) throw new Error('config.json must contain an object');
   const cfg = { ...DEFAULT_CFG, ...user, agents: {} };
   cfg.boost = { ...DEFAULT_CFG.boost, ...(user.boost || {}) };
   cfg.dev = { ...DEFAULT_CFG.dev, ...(user.dev || {}) };
@@ -72,13 +71,7 @@ function loadConfig() {
   // Older configs: ChatGPT-only deepModel / deepMode / deepTimeoutSec.
   if (user.deepMode && !user.boost?.mode) cfg.boost.mode = user.deepMode;
   if (user.deepTimeoutSec && !user.boost?.timeoutSec) cfg.boost.timeoutSec = user.deepTimeoutSec;
-  for (const id of AI_IDS) {
-    const u = user.agents?.[id] || {};
-    const a = { ...DEFAULT_CFG.agents[id], ...u };
-    if (!('boost' in u) && u.deepModel) a.boost = { model: u.deepModel, effort: u.deepEffort };
-    else if ('boost' in u) a.boost = u.boost ? { ...(DEFAULT_CFG.agents[id].boost || {}), ...u.boost } : null;
-    cfg.agents[id] = a;
-  }
+  cfg.agents = normalizeAgents(user.agents);
   // Config files written before the language setting existed all belong to Korean rooms.
   cfg.language = setLang(user.language ?? (Object.keys(user).length ? 'ko' : 'auto'));
   cfg.roomName = cfg.roomName || LANG_DEFAULTS[cfg.language].roomName;
@@ -203,7 +196,7 @@ const T = {
     imgLimit: '작업공간 파일 개수 한도라 못 올려',
     tooLarge: '보낸 내용이 너무 커',
     noSticker: '없는 스티커야',
-    boostWho: '누구를 진심모드로 할지 적어줘. 예: /boost @Grok 이거 봐줘',
+    boostWho: '누구를 진심모드로 할지 적어줘. 예: /boost @ChatGPT-3 이거 봐줘',
     boostOff: '진심모드가 꺼져 있어. 방 설정에서 켜줘.',
     boostNone: '그 멤버는 진심모드 설정이 없어',
     boostArmed: (names) => `⚡ ${withJosa(cfg.userName, cfg.userName, '이/가')} ${names} 진심모드를 켰어 (다음 턴)`,
@@ -258,7 +251,7 @@ const T = {
     imgLimit: "The Workspace is at its file limit, so the image can't be uploaded",
     tooLarge: 'That was too big to send',
     noSticker: "That sticker doesn't exist",
-    boostWho: 'Say who to put in Boost mode, e.g. /boost @Grok take a look at this',
+    boostWho: 'Say who to put in Boost mode, e.g. /boost @ChatGPT-3 take a look at this',
     boostOff: 'Boost mode is off. Turn it on in the room settings.',
     boostNone: "That member doesn't have Boost mode settings",
     boostArmed: (names) => `⚡ ${cfg.userName} turned on Boost mode for ${names} (next turn)`,
@@ -313,7 +306,7 @@ const T = {
     imgLimit: 'ワークスペースのファイル数が上限だからアップできない',
     tooLarge: '送った内容が大きすぎる',
     noSticker: 'そのスタンプはないよ',
-    boostWho: '誰を本気モードにするか書いて。例: /boost @Grok これ見て',
+    boostWho: '誰を本気モードにするか書いて。例: /boost @ChatGPT-3 これ見て',
     boostOff: '本気モードがオフになってる。ルーム設定でオンにして。',
     boostNone: 'そのメンバーには本気モードの設定がないよ',
     boostArmed: (names) => `⚡ ${cfg.userName}が${names}の本気モードをオンにした(次のターン)`,
@@ -352,6 +345,7 @@ function memberView(id) {
   else if (Date.now() < a.offlineUntil) status = 'error';
   return {
     id, name: MEMBERS[id].name, maker: MEMBERS[id].maker, color: MEMBERS[id].color,
+    aliases: MEMBERS[id].aliases, provider: 'codex', account: 'codex',
     model: cfg.agents[id].model, imageGen: MEMBERS[id].imageGen && cfg.imageGen,
     status, drawing: a.imageBusy, enabled: room.enabled[id], available: avail[id],
     calls: a.calls, lastMs: a.lastMs, lastError: a.lastError,
@@ -668,7 +662,7 @@ async function runTurn(a) {
         const f = store.readFile(act.open);
         let opened;
         if (!f.image) {
-          const limit = a.id === 'gemini' ? 12000 : 40000;
+          const limit = 40000;
           opened = { rel: f.rel, text: f.text.length > limit ? f.text.slice(0, limit) + tx().cut(f.text.length - limit) : f.text };
         } else if (adapters.canSee(a.id)) {
           opened = { rel: f.rel, image: store.abs(f.rel) };

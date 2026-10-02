@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Setup helper (run by setup.bat / setup.sh): picks the room language, finds the four member
-// CLIs, offers to install the missing ones with each vendor's official installer and to log
+// Setup helper (run by setup.bat / setup.sh): picks the room language, finds Codex CLI,
+// offers to install it with the official OpenAI installer and to log
 // in, writes config.json, and can start the room. Nothing is installed or changed without
 // asking first.
 //
@@ -15,6 +15,8 @@ import readline from 'node:readline';
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { resolveBins, run, Adapters } from './lib/agents.mjs';
+import { AI_IDS, MEMBERS } from './lib/members.mjs';
+import { normalizeAgents } from './lib/chatgpt-config.mjs';
 import { LANGS, LANG_NAMES, LANG_DEFAULTS, resolveLang, setLang, pick } from './lib/i18n.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -27,42 +29,14 @@ const EXAMPLE = path.join(ROOT, 'config.example.json');
 const ORIG_PATH = process.env.PATH || '';
 
 // Official install commands (Windows: PowerShell, macOS/Linux: sh). Sources:
-// code.claude.com/docs/en/setup, github.com/openai/codex, docs.x.ai/build/overview,
-// antigravity.google/docs/cli/install
-const CLIS = [
-  {
-    id: 'claude', bin: 'claude', member: 'Claude', product: 'Claude Code',
-    need: {
-      ko: 'Claude Pro·Max·Team 등 유료 요금제 (무료 요금제는 안 됨)',
-      en: "a paid Claude plan (Pro, Max, Team…; the free plan doesn't include Claude Code)",
-      ja: '有料のClaudeプラン（Pro・Max・Teamなど。無料プランではClaude Codeは使えない）',
-    },
-    win: 'irm https://claude.ai/install.ps1 | iex',
-    unix: 'curl -fsSL https://claude.ai/install.sh | bash',
-    login: ['auth', 'login'],
-  },
-  {
-    id: 'gpt', bin: 'codex', member: 'ChatGPT', product: 'Codex CLI',
-    need: { ko: 'ChatGPT 계정', en: 'a ChatGPT account', ja: 'ChatGPTアカウント' },
-    win: 'irm https://chatgpt.com/codex/install.ps1 | iex',
-    unix: 'curl -fsSL https://chatgpt.com/codex/install.sh | sh',
-    login: ['login'],
-  },
-  {
-    id: 'grok', bin: 'grok', member: 'Grok', product: 'Grok Build CLI',
-    need: { ko: 'SuperGrok 또는 X Premium+', en: 'SuperGrok or X Premium+', ja: 'SuperGrok または X Premium+' },
-    win: 'irm https://x.ai/cli/install.ps1 | iex',
-    unix: 'curl -fsSL https://x.ai/cli/install.sh | bash',
-    login: ['login'],
-  },
-  {
-    id: 'gemini', bin: 'agy', member: 'Gemini', product: 'Antigravity CLI',
-    need: { ko: 'Google 계정', en: 'a Google account', ja: 'Googleアカウント' },
-    win: 'irm https://antigravity.google/cli/install.ps1 | iex',
-    unix: 'curl -fsSL https://antigravity.google/cli/install.sh | bash',
-    login: [], // no login command: the first interactive run opens the browser
-  },
-];
+// github.com/openai/codex (Codex is the only required CLI in this fork).
+const CLIS = [{
+  id: 'gpt', bin: 'codex', member: 'ChatGPT x4', product: 'Codex CLI',
+  need: { ko: 'Codex를 사용할 수 있는 ChatGPT 계정 하나', en: 'one ChatGPT account with Codex access', ja: 'Codexを利用できるChatGPTアカウント1つ' },
+  win: 'irm https://chatgpt.com/codex/install.ps1 | iex',
+  unix: 'curl -fsSL https://chatgpt.com/codex/install.sh | sh',
+  login: ['login'],
+}];
 
 // ---- strings ----
 // Read with tr() at use time: the language is only known after the first question.
@@ -85,7 +59,7 @@ const T = {
     roomOn: '방이 켜져 있음',
     portBad: (st) => `못 씀 (${st})`,
     stepInstall: '없는 CLI 설치',
-    installNote: '각 회사 공식 설치 명령을 이 창에서 그대로 실행해. 없는 멤버는 방에서 오프라인으로 떠 (나중에 설치해도 돼).',
+    installNote: 'OpenAI 공식 Codex 설치 명령만 실행해. Codex 하나로 네 멤버 모두 연결돼.',
     need: (n) => `필요: ${n}`,
     installQ: '설치할까?',
     installed: (bin) => `설치됨: ${bin}`,
@@ -102,7 +76,7 @@ const T = {
     stepTest: '테스트 대화 (선택)',
     testNote: '모델 이름·로그인이 실제로 되는지 멤버마다 한 번 불러 봐. 사용량이 아주 조금 들어.',
     testQ: '해 볼까?',
-    testing: '멤버마다 "OK" 한마디만 받아 볼게 (각 10~60초).',
+    testing: '네 멤버를 차례로 호출해서 "OK" 응답을 확인해.',
     secs: (s) => `${s}초`,
     failed: '[실패]',
     modelHint: (id) => `모델 이름이 이 계정에서 안 될 수 있어. config.json의 agents.${id}.model을 바꿔 봐.`,
@@ -158,7 +132,7 @@ const T = {
     roomOn: 'room is running',
     portBad: (st) => `unusable (${st})`,
     stepInstall: 'Install missing CLIs',
-    installNote: "Runs each vendor's official install command right in this window. Members without their CLI just show as offline in the room (you can install later).",
+    installNote: "Runs only the official OpenAI Codex installer. One Codex login connects all four members.",
     need: (n) => `needs: ${n}`,
     installQ: 'Install it?',
     installed: (bin) => `Installed: ${bin}`,
@@ -175,7 +149,7 @@ const T = {
     stepTest: 'Test chat (optional)',
     testNote: 'Calls each member once to check that the model name and login really work. Uses a tiny bit of usage.',
     testQ: 'Try it?',
-    testing: 'Asking each member for a single "OK" (10–60 s each).',
+    testing: 'Asking all four members for one "OK" each, sequentially.',
     secs: (s) => `${s}s`,
     failed: '[FAIL]',
     modelHint: (id) => `This account may not have that model. Try changing agents.${id}.model in config.json.`,
@@ -231,7 +205,7 @@ const T = {
     roomOn: 'ルームが起動中',
     portBad: (st) => `使えない (${st})`,
     stepInstall: '足りないCLIのインストール',
-    installNote: '各社の公式インストールコマンドを、このウィンドウでそのまま実行するよ。CLIがないメンバーはルームでオフライン表示になるだけ（後からインストールしてもOK）。',
+    installNote: 'OpenAI公式のCodexだけをインストールするよ。1つのログインで4人全員が接続される。',
     need: (n) => `必要: ${n}`,
     installQ: 'インストールする？',
     installed: (bin) => `インストールできたよ: ${bin}`,
@@ -248,7 +222,7 @@ const T = {
     stepTest: 'テスト会話（任意）',
     testNote: 'モデル名とログインが本当に使えるか、メンバーごとに1回ずつ呼んでみるよ。使用量がほんの少しかかる。',
     testQ: 'やってみる？',
-    testing: 'メンバーごとに「OK」を一言だけもらうね（それぞれ10〜60秒）。',
+    testing: '4人を順番に呼び出して「OK」の応答を確認するよ。',
     secs: (s) => `${s}秒`,
     failed: '[失敗]',
     modelHint: (id) => `このアカウントではそのモデルが使えないかも。config.jsonのagents.${id}.modelを変えてみて。`,
@@ -449,38 +423,14 @@ async function version(bin) {
 // true / false / null (could not tell). Reads login state only; no model calls.
 async function loggedIn(c, bin) {
   try {
-    if (c.id === 'claude') {
-      const r = await run(bin, ['auth', 'status'], { cwd: TMP, timeoutMs: 20000 });
-      const j = JSON.parse(r.stdout);
-      return { ok: j.loggedIn === true, note: j.loggedIn ? j.subscriptionType || '' : '' };
-    }
     if (c.id === 'gpt') {
       const r = await run(bin, ['login', 'status'], { cwd: TMP, timeoutMs: 20000 });
       const t = r.stdout + r.stderr;
       if (/not logged in/i.test(t)) return { ok: false };
-      if (/logged in/i.test(t)) return { ok: true, note: (t.match(/using (ChatGPT)/i) || [])[1] || '' };
+      if (/logged in/i.test(t)) return { ok: true, note: /API key/i.test(t) ? 'API key (API billing, not ChatGPT subscription)' : /ChatGPT/i.test(t) ? 'ChatGPT' : '' };
       return { ok: null };
     }
-    if (c.id === 'grok') {
-      const r = await run(bin, ['models'], { cwd: TMP, timeoutMs: 40000 });
-      const t = r.stdout + r.stderr;
-      if (/you are logged in/i.test(t)) return { ok: true };
-      if (/not logged in|log ?in|sign ?in|unauthori[sz]ed/i.test(t)) return { ok: false };
-      return { ok: null };
-    }
-    if (c.id === 'gemini') {
-      const r = await run(bin, ['-p', '/usage', '--output-format', 'json'], { cwd: TMP, timeoutMs: 30000 });
-      try {
-        const j = JSON.parse(r.stdout);
-        if (j.status === 'SUCCESS' && j.command?.data?.groups?.length) return { ok: true };
-      } catch { /* not json */ }
-      const t = r.stdout + r.stderr;
-      // Google's side sometimes answers 503 or not at all; that says nothing about the login.
-      if (r.timedOut) return { ok: null, note: tr().noResponse };
-      if (/\b503\b|UNAVAILABLE/.test(t)) return { ok: null, note: tr().google503 };
-      if (/auth|log ?in|sign ?in|credential/i.test(t)) return { ok: false };
-      return { ok: null };
-    }
+
   } catch { /* unreadable output */ }
   return { ok: null };
 }
@@ -504,7 +454,7 @@ function printTable(list) {
   for (const s of list) {
     const mark = !s.bin ? red('[--]') : s.login.ok === true ? green('[OK]') : yellow('[!!]');
     const where = s.bin ? `${s.c.bin} ${s.ver || '?'}` : s.c.bin;
-    say(`  ${mark} ${s.c.member.padEnd(8)} ${dim(where.padEnd(22))} ${loginText(s)}`);
+    say(`  ${mark} ${s.c.member.padEnd(10)} ${dim(where.padEnd(22))} ${loginText(s)}`);
   }
 }
 
@@ -605,9 +555,15 @@ async function configure(pins, lang, prevLang) {
   }
 
   const updates = { language: lang, roomName, userName, port };
+  if (edit) updates.agents = normalizeAgents(cfg.agents);
   if (Object.keys(pins).length) updates.bins = { ...(cfg.bins || {}), ...pins };
   if (exists && !edit && Object.entries(updates).every(([k, v]) => canonical(cfg[k]) === canonical(v))) return cfg;
   const out = patchJson(text, cfg, updates);
+  if (exists && out !== text) {
+    const backupDir = path.join(ROOT, 'backups');
+    fs.mkdirSync(backupDir, { recursive: true });
+    fs.copyFileSync(CONFIG, path.join(backupDir, `config-${Date.now()}.json`));
+  }
   fs.writeFileSync(CONFIG, out);
   say(green(`  ${t.saved(rel)}`) + dim(t.savedWhat(userName, port)));
   return JSON.parse(out);
@@ -618,8 +574,7 @@ async function configure(pins, lang, prevLang) {
 function roomConfig() {
   const ex = JSON.parse(fs.readFileSync(EXAMPLE, 'utf8'));
   const user = readConfig();
-  const agents = {};
-  for (const c of CLIS) agents[c.id] = { ...ex.agents[c.id], ...(user.agents?.[c.id] || {}) };
+  const agents = normalizeAgents(user.agents || ex.agents);
   return { ...ex, ...user, agents, webSearch: false, turnTimeoutSec: 120 };
 }
 
@@ -629,19 +584,19 @@ async function testCalls(ready, bins) {
   ad.bins = bins;
   const t = tr();
   say(dim(`  ${t.testing}`));
-  await Promise.all(ready.map(async (s) => {
-    const id = s.c.id;
+  for (const id of AI_IDS) {
+    const member = MEMBERS[id].name;
     const model = cfg.agents[id].model;
     let r;
     try { r = await ad.chat(id, 'This is a connection test. Reply with exactly: OK', 'ping'); } catch (e) { r = { ok: false, detail: String(e) }; }
     if (r.ok) {
-      say(`  ${green('[OK]')} ${s.c.member.padEnd(8)} ${dim(`${model} · ${t.secs((r.ms / 1000).toFixed(1))}`)}`);
-      return;
+      say(`  ${green('[OK]')} ${member.padEnd(10)} ${dim(`${model} · ${t.secs((r.ms / 1000).toFixed(1))}`)}`);
+      continue;
     }
     const last = (r.detail || '').split('\n').map((l) => l.trim()).filter(Boolean).pop() || '';
-    say(`  ${red(t.failed)} ${s.c.member.padEnd(8)} ${dim(model)} ${last.slice(0, 160)}`);
+    say(`  ${red(t.failed)} ${member.padEnd(10)} ${dim(model)} ${last.slice(0, 160)}`);
     if (/model/i.test(r.detail || '')) say(dim(`         ${t.modelHint(id)}`));
-  }));
+  }
 }
 
 // ---- Windows desktop shortcut ----
