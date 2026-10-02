@@ -1,0 +1,27 @@
+name: Node checks
+on:
+  push:
+    branches: [main, chatgpt-only]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Check JavaScript syntax
+        run: node scripts/check.mjs
+      - name: Offline regression and HTTP integration tests
+        run: node --test test/chatgpt.test.mjs test/server.test.mjs
+      - name: Install official Codex CLI for compatibility checks
+        run: npm install --global @openai/codex@latest
+      - name: Check current Codex executable and flags (no model calls)
+        run: node scripts/check-codex.mjs
