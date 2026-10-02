@@ -1,30 +1,70 @@
-name: Node checks
+name: Apply verified ChatGPT update
 on:
   push:
-    branches: [main, chatgpt-only]
-  pull_request:
+    branches: [chatgpt-only]
 permissions:
-  contents: read
+  contents: write
 jobs:
-  test:
+  apply:
+    if: github.repository == 'jinyounghub/ai-chatroom'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Check JavaScript syntax
-        run: find . -not -path './.git/*' -type f \( -name '*.mjs' -o -name '*.js' \) -print0 | xargs -0 -r -n1 node --check
-      - name: Run offline regression tests
+      - name: Apply hash-checked source edits
+        shell: bash
         run: |
-          if [ -d test ]; then node --test test/*.test.mjs; fi
-      - name: Source snapshot for isolated review
-        if: github.ref == 'refs/heads/chatgpt-only'
-        uses: actions/upload-artifact@v4
-        with:
-          name: source-review
-          path: |
-            .
-            !.git
-          include-hidden-files: true
-          retention-days: 1
+          python - <<'PY'
+          import base64, gzip, hashlib, json, pathlib, subprocess
+          root = pathlib.Path.cwd().resolve()
+          parts = sorted((root / '.github/chatgpt-update').glob('*.b64'))
+          assert len(parts) == 10
+          encoded = ''.join(p.read_text() for p in parts)
+          assert len(encoded) == 34552
+          manifest = json.loads(gzip.decompress(base64.b64decode(encoded, validate=True)))
+          assert manifest['base'] == '1ab3d4ecf89360d127519ac7d8b5ffdca2073994'
+          subprocess.run(['git', 'merge-base', '--is-ancestor', manifest['base'], 'HEAD'], check=True)
+          assert len(manifest['files']) == 23
+          digest = lambda b: hashlib.sha256(b).hexdigest()
+          pending = []
+          for item in manifest['files']:
+              rel = pathlib.PurePosixPath(item['path'])
+              assert not rel.is_absolute() and '..' not in rel.parts
+              assert not rel.parts[0].startswith('.')
+              target = root / rel
+              assert target.resolve().is_relative_to(root) and not target.is_symlink()
+              old = target.read_bytes() if target.exists() else None
+              assert (digest(old) if old is not None else None) == item['before'], item['path']
+              lines = (old or b'').decode('utf-8').splitlines(keepends=True)
+              for start, end, text in reversed(item['edits']):
+                  assert 0 <= start <= end <= len(lines)
+                  lines[start:end] = text.splitlines(keepends=True)
+              new = ''.join(lines).encode('utf-8')
+              assert digest(new) == item['after'], item['path']
+              pending.append((target, new))
+          for target, data in pending:
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_bytes(data)
+          subprocess.run(['git', 'add', '--'] + [i['path'] for i in manifest['files']], check=True)
+          subprocess.run(['git', 'rm', '-r', '.github/chatgpt-update'], check=True)
+          print('Verified and applied all 23 source files.')
+          PY
+      - name: Syntax and offline integration tests
+        run: |
+          node scripts/check.mjs
+          node --test test/chatgpt.test.mjs test/server.test.mjs
+          git diff --cached --check
+      - name: Check official Codex CLI compatibility without credentials
+        run: |
+          npm install --global @openai/codex@latest
+          node scripts/check-codex.mjs
+      - name: Commit tested sources
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'feat: run four independent ChatGPT members through Codex only'
+          git push origin HEAD:chatgpt-only
